@@ -235,8 +235,11 @@ Gaussian rendering 쪽에서 `gsplat`을 사용합니다.
 ```bash
 export CUDA_HOME=/usr/local/cuda-12.8
 export TORCH_CUDA_ARCH_LIST="12.0"
+export FORCE_CUDA=1
+export MAX_JOBS=10
 
-pip install "git+https://github.com/nerfstudio-project/gsplat.git@2323de5905d5e90e035f792fe65bad0fedd413e7"
+pip install --no-build-isolation \
+  "git+https://github.com/nerfstudio-project/gsplat.git@2323de5905d5e90e035f792fe65bad0fedd413e7"
 ```
 
 ## MoGe 설치
