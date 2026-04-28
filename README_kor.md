@@ -270,29 +270,13 @@ sam3d_objects/model/backbone/tdfy_dit/modules/sparse/__init__.py
 BACKEND = "spconv"
 ```
 
-공식 requirements는 `spconv-cu121==2.3.8`을 요구하지만, RTX 5060 Ti에서는 cu121 wheel을 그대로 쓰면 호환성 문제가 날 가능성이 큽니다.
+공식 requirements는 `spconv-cu121==2.3.8`을 요구하지만, RTX 5060 Ti에서는 cu121 wheel을 그대로 쓰면 호환성 문제가 날 가능성이 크지만 또 backend 바꾸면 문제 터짐
 
-우선 시도 순서:
-
-```bash
-pip uninstall -y spconv spconv-cu121 spconv-cu124 spconv-cu126 cumm cumm-cu121 cumm-cu124 cumm-cu126
-```
-
-그 다음 선택지는 둘입니다.
-
-1. `spconv`를 CUDA 12.8 / arch 12.0 대상으로 source 또는 JIT build
-2. repo의 sparse backend를 `torchsparse`로 바꾸고 torchsparse를 별도 빌드
-
-1번을 먼저 시도하는 것을 권장합니다.
 
 ```bash
-export CUDA_HOME=/usr/local/cuda-12.8
-export TORCH_CUDA_ARCH_LIST="12.0"
-export CUMM_CUDA_ARCH_LIST="12.0"
+pip install spconv-cu120
 ```
-
-spconv 쪽은 환경에 따라 빌드 절차가 달라질 수 있으므로, 여기서 실패하면 에러 로그를 기준으로 따로 맞추는 것이 좋습니다. `demo.py` 호환성 문제의 마지막 큰 산이 보통 이 지점입니다.
-
+이후 걍 demp.py 돌리면서 의존성 확인해보셈 ㅅㄱ
 ## 설치 후 점검
 
 아래 import가 통과하는지 먼저 봅니다.
