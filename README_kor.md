@@ -211,10 +211,15 @@ PY
 이 repo는 PyTorch3D를 많이 import합니다. cu128 조합에서는 prebuilt wheel이 없을 수 있으므로 source build를 시도합니다.
 
 ```bash
+python -m pip install -U pip setuptools wheel ninja cmake packaging
+pip install fvcore iopath
+
 export CUDA_HOME=/usr/local/cuda-12.8
 export TORCH_CUDA_ARCH_LIST="12.0"
+export FORCE_CUDA=1
 
-pip install "git+https://github.com/facebookresearch/pytorch3d.git@75ebeeaea0908c5527e7b1e305fbc7681382db47"
+pip install --no-build-isolation \
+  "git+https://github.com/facebookresearch/pytorch3d.git@75ebeeaea0908c5527e7b1e305fbc7681382db47"
 ```
 
 빌드가 실패하면 먼저 아래 시스템 패키지를 확인합니다.
