@@ -1,5 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
+import gc
 import os
+from contextlib import contextmanager
 
 from tqdm import tqdm
 import torch
@@ -91,12 +93,14 @@ class InferencePipeline:
         rendering_engine: str = "nvdiffrast",  # nvdiffrast OR pytorch3d,
         shape_model_dtype=None,
         compile_model=False,
+        vram_optimized=True,
         slat_mean=SLAT_MEAN,
         slat_std=SLAT_STD,
     ):
         self.rendering_engine = rendering_engine
         self.device = torch.device(device)
         self.compile_model = compile_model
+        self.vram_optimized = vram_optimized
         logger.info(f"self.device: {self.device}")
         logger.info(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', None)}")
         logger.info(f"Actually using GPU: {torch.cuda.current_device()}")
@@ -129,73 +133,34 @@ class InferencePipeline:
             self.pose_decoder = self.init_pose_decoder(ss_generator_config_path, pose_decoder_name)
             self.ss_preprocessor = self.init_ss_preprocessor(ss_preprocessor, ss_generator_config_path)
             self.slat_preprocessor = slat_preprocessor
-    
-            logger.info("Loading model weights...")
 
-            ss_generator = self.init_ss_generator(
-                ss_generator_config_path, ss_generator_ckpt_path
-            )
-            slat_generator = self.init_slat_generator(
-                slat_generator_config_path, slat_generator_ckpt_path
-            )
-            ss_decoder = self.init_ss_decoder(
-                ss_decoder_config_path, ss_decoder_ckpt_path
-            )
-            ss_encoder = self.init_ss_encoder(
-                ss_encoder_config_path, ss_encoder_ckpt_path
-            )
-            slat_decoder_gs = self.init_slat_decoder_gs(
-                slat_decoder_gs_config_path, slat_decoder_gs_ckpt_path
-            )
-            slat_decoder_gs_4 = self.init_slat_decoder_gs(
-                slat_decoder_gs_4_config_path, slat_decoder_gs_4_ckpt_path
-            )
-            slat_decoder_mesh = self.init_slat_decoder_mesh(
-                slat_decoder_mesh_config_path, slat_decoder_mesh_ckpt_path
-            )
-
-            # Load conditioner embedder so that we only load it once
-            ss_condition_embedder = self.init_ss_condition_embedder(
-                ss_generator_config_path, ss_generator_ckpt_path
-            )
-            slat_condition_embedder = self.init_slat_condition_embedder(
-                slat_generator_config_path, slat_generator_ckpt_path
-            )
-
-            self.condition_embedders = {
-                "ss_condition_embedder": ss_condition_embedder,
-                "slat_condition_embedder": slat_condition_embedder,
+            # 각 stage에서 필요한 모델만 로드하기 위해 경로만 저장하고, 여기서는 모델을 생성하지 않는다.
+            self._model_init_args = {
+                "ss_generator": (ss_generator_config_path, ss_generator_ckpt_path),
+                "slat_generator": (slat_generator_config_path, slat_generator_ckpt_path),
+                "ss_decoder": (ss_decoder_config_path, ss_decoder_ckpt_path),
+                "ss_encoder": (ss_encoder_config_path, ss_encoder_ckpt_path),
+                "slat_decoder_gs": (slat_decoder_gs_config_path, slat_decoder_gs_ckpt_path),
+                "slat_decoder_gs_4": (slat_decoder_gs_4_config_path, slat_decoder_gs_4_ckpt_path),
+                "slat_decoder_mesh": (slat_decoder_mesh_config_path, slat_decoder_mesh_ckpt_path),
+                "ss_condition_embedder": (ss_generator_config_path, ss_generator_ckpt_path),
+                "slat_condition_embedder": (slat_generator_config_path, slat_generator_ckpt_path),
             }
+            self.models = torch.nn.ModuleDict()
+            self.condition_embedders = {}
 
-            # override generator and condition embedder setting
-            self.override_ss_generator_cfg_config(
-                ss_generator,
-                cfg_strength=ss_cfg_strength,
-                inference_steps=ss_inference_steps,
-                rescale_t=ss_rescale_t,
-                cfg_interval=ss_cfg_interval,
-                cfg_strength_pm=ss_cfg_strength_pm,
-            )
-            self.override_slat_generator_cfg_config(
-                slat_generator,
-                cfg_strength=slat_cfg_strength,
-                inference_steps=slat_inference_steps,
-                rescale_t=slat_rescale_t,
-                cfg_interval=slat_cfg_interval,
-            )
+            # 이 파이프라인은 VRAM 절감을 위해 항상 stage 단위 로드/해제를 사용한다.
+            if not self.vram_optimized:
+                logger.warning(
+                    "vram_optimized=False is ignored; models are always loaded per stage and released after use."
+                )
+                self.vram_optimized = True
 
-            self.models = torch.nn.ModuleDict(
-                {
-                    "ss_generator": ss_generator,
-                    "slat_generator": slat_generator,
-                    "ss_encoder": ss_encoder,
-                    "ss_decoder": ss_decoder,
-                    "slat_decoder_gs": slat_decoder_gs,
-                    "slat_decoder_gs_4": slat_decoder_gs_4,
-                    "slat_decoder_mesh": slat_decoder_mesh,
-                }
-            )
-            logger.info("Loading model weights completed!")
+            if self.compile_model:
+                logger.warning(
+                    "compile_model=True keeps compiled graphs around and is disabled for stage-wise VRAM management."
+                )
+                self.compile_model = False
 
             if self.compile_model:
                 logger.info("Compiling model...")
@@ -203,6 +168,112 @@ class InferencePipeline:
                 logger.info("Model compilation completed!")
             self.slat_mean = torch.tensor(slat_mean)
             self.slat_std = torch.tensor(slat_std)
+
+            self._cleanup_cuda_memory()
+
+    @staticmethod
+    def _cleanup_cuda_memory():
+        # stage 종료 후 Python 객체와 CUDA 캐시를 함께 정리해 VRAM 반환을 최대화한다.
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+
+    def _move_to_device(self, obj, device):
+        # 중간 산출물은 기본적으로 CPU에 보관하고, stage 실행 직전에만 GPU로 옮긴다.
+        if obj is None:
+            return None
+        if isinstance(obj, torch.Tensor):
+            return obj.to(device)
+        if isinstance(obj, sp.SparseTensor):
+            return obj.to(device)
+        if isinstance(obj, dict):
+            return {k: self._move_to_device(v, device) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [self._move_to_device(v, device) for v in obj]
+        if isinstance(obj, tuple):
+            return tuple(self._move_to_device(v, device) for v in obj)
+        if hasattr(obj, "__dict__") and obj.__class__.__module__.startswith("sam3d_objects."):
+            for key, value in vars(obj).items():
+                setattr(obj, key, self._move_to_device(value, device))
+        return obj
+
+    def _to_cpu(self, obj):
+        return self._move_to_device(obj, torch.device("cpu"))
+
+    def _load_models(self, model_names):
+        # 현재 stage가 요구한 모델만 GPU에 올린다.
+        for model_name in model_names:
+            if model_name in self.models:
+                continue
+            model = self._init_model_by_name(model_name)
+            if model is not None:
+                self.models[model_name] = model
+
+    def _load_condition_embedders(self, embedder_names):
+        for embedder_name in embedder_names:
+            if embedder_name in self.condition_embedders:
+                continue
+            self.condition_embedders[embedder_name] = self._init_model_by_name(embedder_name)
+
+    def _init_model_by_name(self, model_name):
+        args = self._model_init_args[model_name]
+        if model_name == "ss_generator":
+            model = self.init_ss_generator(*args)
+            self.override_ss_generator_cfg_config(
+                model,
+                cfg_strength=self.ss_cfg_strength,
+                inference_steps=self.ss_inference_steps,
+                rescale_t=self.ss_rescale_t,
+                cfg_interval=self.ss_cfg_interval,
+                cfg_strength_pm=self.ss_cfg_strength_pm,
+            )
+            return model
+        if model_name == "slat_generator":
+            model = self.init_slat_generator(*args)
+            self.override_slat_generator_cfg_config(
+                model,
+                cfg_strength=self.slat_cfg_strength,
+                inference_steps=self.slat_inference_steps,
+                rescale_t=self.slat_rescale_t,
+                cfg_interval=self.slat_cfg_interval,
+            )
+            return model
+        if model_name == "ss_decoder":
+            return self.init_ss_decoder(*args)
+        if model_name == "ss_encoder":
+            return self.init_ss_encoder(*args)
+        if model_name in ("slat_decoder_gs", "slat_decoder_gs_4"):
+            return self.init_slat_decoder_gs(*args)
+        if model_name == "slat_decoder_mesh":
+            return self.init_slat_decoder_mesh(*args)
+        if model_name == "ss_condition_embedder":
+            return self.init_ss_condition_embedder(*args)
+        if model_name == "slat_condition_embedder":
+            return self.init_slat_condition_embedder(*args)
+        raise KeyError(f"Unknown model name: {model_name}")
+
+    def _release_models(self, model_names, embedder_names=()):
+        # stage가 끝나면 모델 참조를 제거하고 CUDA 캐시를 비운다.
+        for model_name in model_names:
+            if model_name in self.models:
+                del self.models[model_name]
+        for embedder_name in embedder_names:
+            self.condition_embedders.pop(embedder_name, None)
+        self._cleanup_cuda_memory()
+
+    @contextmanager
+    def stage_model_context(self, stage_name, model_names=(), embedder_names=()):
+        # 모든 추론 stage는 이 context 안에서만 모델을 GPU에 유지한다.
+        logger.info(f"Loading {stage_name} models to {self.device}...")
+        self._load_models(model_names)
+        self._load_condition_embedders(embedder_names)
+        try:
+            yield
+        finally:
+            logger.info(f"Releasing {stage_name} models from VRAM...")
+            self._release_models(model_names, embedder_names)
 
     def _compile(self):
         torch._dynamo.config.cache_size_limit = 64
@@ -271,7 +342,7 @@ class InferencePipeline:
         model = instantiate(config)
 
         if ckpt_path.endswith(".safetensors"):
-            state_dict = load_file(ckpt_path, device="cuda")
+            state_dict = load_file(ckpt_path, device="cpu")
             if state_dict_fn is not None:
                 state_dict = state_dict_fn(state_dict)
             model.load_state_dict(state_dict, strict=False)
@@ -497,12 +568,20 @@ class InferencePipeline:
             ss_input_dict = self.preprocess_image(image, self.ss_preprocessor)
             slat_input_dict = self.preprocess_image(image, self.slat_preprocessor)
             torch.manual_seed(seed)
-            ss_return_dict = self.sample_sparse_structure(
-                ss_input_dict,
-                inference_steps=stage1_inference_steps,
-                use_distillation=use_stage1_distillation,
-            )
+            # Stage 2: sparse structure 생성에 필요한 모델만 GPU에 올린다.
+            with self.stage_model_context(
+                "Stage 2 sparse structure",
+                model_names=("ss_generator", "ss_decoder"),
+                embedder_names=("ss_condition_embedder",),
+            ):
+                ss_return_dict = self.sample_sparse_structure(
+                    self._move_to_device(ss_input_dict, self.device),
+                    inference_steps=stage1_inference_steps,
+                    use_distillation=use_stage1_distillation,
+                )
+                ss_return_dict = self._to_cpu(ss_return_dict)
 
+            # Stage 2 산출물은 CPU 상태에서 pose decoder와 후속 stage 입력으로 사용한다.
             ss_return_dict.update(self.pose_decoder(ss_return_dict))
 
             if "scale" in ss_return_dict:
@@ -514,18 +593,46 @@ class InferencePipeline:
                 return ss_return_dict
 
             coords = ss_return_dict["coords"]
-            slat = self.sample_slat(
-                slat_input_dict,
-                coords,
-                inference_steps=stage2_inference_steps,
-                use_distillation=use_stage2_distillation,
-            )
-            outputs = self.decode_slat(
-                slat, self.decode_formats if decode_formats is None else decode_formats
-            )
+            # Stage 3: splat latent 생성 모델만 로드하고, 결과 slat은 즉시 CPU로 내린다.
+            with self.stage_model_context(
+                "Stage 3 splat latent",
+                model_names=("slat_generator",),
+                embedder_names=("slat_condition_embedder",),
+            ):
+                slat = self.sample_slat(
+                    self._move_to_device(slat_input_dict, self.device),
+                    coords.to(self.device),
+                    inference_steps=stage2_inference_steps,
+                    use_distillation=use_stage2_distillation,
+                )
+                slat = self._to_cpu(slat)
+
+            active_decode_formats = self.decode_formats if decode_formats is None else decode_formats
+            decoder_model_names = []
+            if "mesh" in active_decode_formats:
+                decoder_model_names.append("slat_decoder_mesh")
+            if "gaussian" in active_decode_formats:
+                decoder_model_names.append("slat_decoder_gs")
+            if "gaussian_4" in active_decode_formats:
+                decoder_model_names.append("slat_decoder_gs_4")
+            
+            # Stage 4: 요청된 출력 포맷에 필요한 decoder만 GPU에 올린다.
+            with self.stage_model_context(
+                "Stage 4 decoder",
+                model_names=tuple(decoder_model_names),
+            ):
+                outputs = self.decode_slat(
+                    self._move_to_device(slat, self.device), active_decode_formats
+                )
+                outputs = self._to_cpu(outputs)
             outputs = self.postprocess_slat_output(
-                outputs, with_mesh_postprocess, with_texture_baking, use_vertex_color
+                self._move_to_device(outputs, self.device) if with_texture_baking else outputs,
+                with_mesh_postprocess,
+                with_texture_baking,
+                use_vertex_color,
             )
+            outputs = self._to_cpu(outputs)
+            self._cleanup_cuda_memory()
             logger.info("Finished!")
 
             return {
@@ -826,10 +933,10 @@ class InferencePipeline:
             rgb_image_mask, preprocessor.mask_transform
         )
         item = {
-            "mask": processed_mask[None].to(self.device),
-            "image": processed_rgb_image[None].to(self.device),
-            "rgb_image": rgb_image[None].to(self.device),
-            "rgb_image_mask": rgb_image_mask[None].to(self.device),
+            "mask": processed_mask[None],
+            "image": processed_rgb_image[None],
+            "rgb_image": rgb_image[None],
+            "rgb_image_mask": rgb_image_mask[None],
         }
 
         return item
