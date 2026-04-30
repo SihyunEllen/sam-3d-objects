@@ -1,7 +1,7 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
+
+           # Copyright (c) Meta Platforms, Inc. and affiliates.
 from typing import Union, Optional
 from copy import deepcopy
-from contextlib import contextmanager
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -95,45 +95,10 @@ class InferencePipelinePointMap(InferencePipeline):
         self, *args, depth_model, layout_post_optimization_method=layout_post_optimization, layout_post_optimization_method_GS=layout_post_optimization_method_GS, clip_pointmap_beyond_scale=None, **kwargs
     ):
         self.depth_model = depth_model
-        # Hydra가 만든 MoGe 모델도 초기화 직후 CPU로 내려두고 Stage 1에서만 GPU에 올린다.
-        self._release_depth_model()
         self.layout_post_optimization_method = layout_post_optimization_method
         self.layout_post_optimization_method_GS = layout_post_optimization_method_GS
         self.clip_pointmap_beyond_scale = clip_pointmap_beyond_scale
         super().__init__(*args, **kwargs)
-
-    def _load_depth_model(self):
-        # Stage 1 시작 시 MoGe만 GPU에 올린다.
-        if hasattr(self.depth_model, "model"):
-            self.depth_model.model.to(self.device)
-            self.depth_model.device = self.device
-
-    def _release_depth_model(self):
-        # Stage 1 종료 후 MoGe를 CPU로 내리고 CUDA 캐시를 정리한다.
-        if hasattr(self.depth_model, "model"):
-            self.depth_model.model.to("cpu")
-        if hasattr(self.depth_model, "device"):
-            self.depth_model.device = torch.device("cpu")
-        if hasattr(self, "_cleanup_cuda_memory"):
-            self._cleanup_cuda_memory()
-        else:
-            import gc
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-    @contextmanager
-    def depth_model_context(self, enabled=True):
-        # pointmap을 직접 받은 경우에는 MoGe 추론이 필요 없으므로 로드를 건너뛴다.
-        if enabled:
-            logger.info(f"Loading Stage 1 MoGe model to {self.device}...")
-            self._load_depth_model()
-        try:
-            yield
-        finally:
-            if enabled:
-                logger.info("Releasing Stage 1 MoGe model from VRAM...")
-                self._release_depth_model()
 
     def _compile(self):
         torch._dynamo.config.cache_size_limit = 64
@@ -232,26 +197,26 @@ class InferencePipelinePointMap(InferencePipeline):
         # Put in a for loop?
         _item = preprocessor_return_dict
         item = {
-            "mask": _item["mask"][None],
-            "image": _item["image"][None],
-            "rgb_image": _item["rgb_image"][None],
-            "rgb_image_mask": _item["rgb_image_mask"][None],
+            "mask": _item["mask"][None].to(self.device),
+            "image": _item["image"][None].to(self.device),
+            "rgb_image": _item["rgb_image"][None].to(self.device),
+            "rgb_image_mask": _item["rgb_image_mask"][None].to(self.device),
         }
 
         if pointmap is not None and preprocessor.pointmap_transform != (None,):
-            item["pointmap"] = _item["pointmap"][None]
-            item["rgb_pointmap"] = _item["rgb_pointmap"][None]
-            item["pointmap_scale"] = _item["pointmap_scale"][None]
-            item["pointmap_shift"] = _item["pointmap_shift"][None]
-            item["rgb_pointmap_scale"] = _item["rgb_pointmap_scale"][None]
-            item["rgb_pointmap_shift"] = _item["rgb_pointmap_shift"][None]
+            item["pointmap"] = _item["pointmap"][None].to(self.device)
+            item["rgb_pointmap"] = _item["rgb_pointmap"][None].to(self.device)
+            item["pointmap_scale"] = _item["pointmap_scale"][None].to(self.device)
+            item["pointmap_shift"] = _item["pointmap_shift"][None].to(self.device)
+            item["rgb_pointmap_scale"] = _item["rgb_pointmap_scale"][None].to(self.device)
+            item["rgb_pointmap_shift"] = _item["rgb_pointmap_shift"][None].to(self.device)
 
         # Add unnormed pointmap for post-optimization
         if pointmap is not None and preprocessor.pointmap_transform != (None,):
             full_pointmap = self._apply_transform(
                 pointmap, preprocessor.pointmap_transform
             )
-            item["rgb_pointmap_unnorm"] = full_pointmap[None]            
+            item["rgb_pointmap_unnorm"] = full_pointmap[None].to(self.device)            
 
         return item
 
@@ -324,7 +289,8 @@ class InferencePipelinePointMap(InferencePipeline):
                     size=(loaded_image.shape[1], loaded_image.shape[2]),
                     mode="nearest",
                 ).squeeze(0).permute(1, 2, 0)
-            intrinsics = None
+            # pointmap이 제공된 경우 intrinsics 계산 스킵
+            intrinsics = {}
         
         # Prepare the point map tensor
         point_map_tensor = {
@@ -332,6 +298,7 @@ class InferencePipelinePointMap(InferencePipeline):
         }
 
         # If depth model doesn't provide intrinsics, infer them
+        # pointmap이 제공된 경우(intrinsics = {})는 스킵
         if intrinsics is None:
             camera_convention_transform = (
                 Transform3d()
@@ -438,10 +405,7 @@ class InferencePipelinePointMap(InferencePipeline):
     ) -> dict:
         image = self.merge_image_and_mask(image, mask)
         with self.device: 
-            # Stage 1: MoGe로 pointmap/depth를 만들고 결과는 CPU RAM에 보관한다.
-            with self.depth_model_context(enabled=pointmap is None):
-                pointmap_dict = self.compute_pointmap(image, pointmap)
-                pointmap_dict = self._to_cpu(pointmap_dict)
+            pointmap_dict = self.compute_pointmap(image, pointmap)
             pointmap = pointmap_dict["pointmap"]
             pts = type(self)._down_sample_img(pointmap)
             pts_colors = type(self)._down_sample_img(pointmap_dict["pts_color"])
@@ -456,18 +420,11 @@ class InferencePipelinePointMap(InferencePipeline):
             slat_input_dict = self.preprocess_image(image, self.slat_preprocessor)
             if seed is not None:
                 torch.manual_seed(seed)
-            # Stage 2: sparse structure 생성 모델만 GPU에 올린다.
-            with self.stage_model_context(
-                "Stage 2 sparse structure",
-                model_names=("ss_generator", "ss_decoder"),
-                embedder_names=("ss_condition_embedder",),
-            ):
-                ss_return_dict = self.sample_sparse_structure(
-                    self._move_to_device(ss_input_dict, self.device),
-                    inference_steps=stage1_inference_steps,
-                    use_distillation=use_stage1_distillation,
-                )
-                ss_return_dict = self._to_cpu(ss_return_dict)
+            ss_return_dict = self.sample_sparse_structure(
+                ss_input_dict,
+                inference_steps=stage1_inference_steps,
+                use_distillation=use_stage1_distillation,
+            )
 
             # We could probably use the decoder from the models themselves
             pointmap_scale = ss_input_dict.get("pointmap_scale", None)
@@ -494,45 +451,18 @@ class InferencePipelinePointMap(InferencePipeline):
                 # return ss_return_dict
 
             coords = ss_return_dict["coords"]
-            # Stage 3: splat latent 생성 후 GPU 텐서는 CPU로 내려 다음 단계까지 보관한다.
-            with self.stage_model_context(
-                "Stage 3 splat latent",
-                model_names=("slat_generator",),
-                embedder_names=("slat_condition_embedder",),
-            ):
-                slat = self.sample_slat(
-                    self._move_to_device(slat_input_dict, self.device),
-                    coords.to(self.device),
-                    inference_steps=stage2_inference_steps,
-                    use_distillation=use_stage2_distillation,
-                )
-                slat = self._to_cpu(slat)
-
-            active_decode_formats = self.decode_formats if decode_formats is None else decode_formats
-            decoder_model_names = []
-            if "mesh" in active_decode_formats:
-                decoder_model_names.append("slat_decoder_mesh")
-            if "gaussian" in active_decode_formats:
-                decoder_model_names.append("slat_decoder_gs")
-            if "gaussian_4" in active_decode_formats:
-                decoder_model_names.append("slat_decoder_gs_4")
-            # Stage 4: 최종 복원에 필요한 decoder만 로드한다.
-            with self.stage_model_context(
-                "Stage 4 decoder",
-                model_names=tuple(decoder_model_names),
-            ):
-                outputs = self.decode_slat(
-                    self._move_to_device(slat, self.device), active_decode_formats
-                )
-                outputs = self._to_cpu(outputs)
-            outputs = self.postprocess_slat_output(
-                self._move_to_device(outputs, self.device) if with_texture_baking else outputs,
-                with_mesh_postprocess,
-                with_texture_baking,
-                use_vertex_color,
+            slat = self.sample_slat(
+                slat_input_dict,
+                coords,
+                inference_steps=stage2_inference_steps,
+                use_distillation=use_stage2_distillation,
             )
-            outputs = self._to_cpu(outputs)
-            self._cleanup_cuda_memory()
+            outputs = self.decode_slat(
+                slat, self.decode_formats if decode_formats is None else decode_formats
+            )
+            outputs = self.postprocess_slat_output(
+                outputs, with_mesh_postprocess, with_texture_baking, use_vertex_color
+            )
             glb = outputs.get("glb", None)
             gs_input = outputs.get("gaussian", None)
 
@@ -544,15 +474,13 @@ class InferencePipelinePointMap(InferencePipeline):
                     ):
                         logger.info("Running GS layout post optimization method...")
                         postprocessed_pose = self.run_post_optimization_GS(
-                            self._move_to_device(deepcopy(gs_input[0]), self.device),
-                            pointmap_dict["intrinsics"].to(self.device),
-                            self._move_to_device(deepcopy(ss_return_dict), self.device),
-                            self._move_to_device(deepcopy(ss_input_dict), self.device),
+                            deepcopy(gs_input[0]),
+                            pointmap_dict["intrinsics"],
+                            ss_return_dict,
+                            ss_input_dict,
                             backend="gsplat",
                         )
-                        postprocessed_pose = self._to_cpu(postprocessed_pose)
                         ss_return_dict.update(postprocessed_pose)
-                        self._cleanup_cuda_memory()
                         logger.info(f"Finished GS post-optimization!")
                     elif (
                         glb is not None
@@ -561,13 +489,11 @@ class InferencePipelinePointMap(InferencePipeline):
                         logger.info("Running mesh layout post optimization method...")
                         postprocessed_pose = self.run_post_optimization(
                             deepcopy(glb),
-                            pointmap_dict["intrinsics"].to(self.device),
-                            self._move_to_device(deepcopy(ss_return_dict), self.device),
-                            self._move_to_device(deepcopy(ss_input_dict), self.device),
+                            pointmap_dict["intrinsics"],
+                            ss_return_dict,
+                            ss_input_dict,
                         )
-                        postprocessed_pose = self._to_cpu(postprocessed_pose)
                         ss_return_dict.update(postprocessed_pose)
-                        self._cleanup_cuda_memory()
                         logger.info("Finished mesh post-optimization!")
                     else:
                         logger.info("No post-optimization method available (no GS or mesh found)")
